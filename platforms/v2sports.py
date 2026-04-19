@@ -74,90 +74,336 @@ class V2SportsScraper(BasePlatformScraper):
                 return True
         return not await self.wait_for_selector('#customerid', timeout=1500)
 
+    def _market_key(self, bet: dict) -> str:
+        market = (bet.get("market") or "").lower()
+        if "team total" in market:
+            return "team_total"
+        if "total" in market or bet.get("bet_side") in ("over", "under"):
+            return "total"
+        if "spread" in market:
+            return "spread"
+        if "moneyline" in market or market == "ml":
+            return "moneyline"
+        return ""
+
+    async def _has_schedule_lines(self) -> bool:
+        try:
+            return await self.page.evaluate(
+                "() => /\\b(?:o|u)\\d+|[+-]\\d{3,4}/i.test(document.body?.innerText || '')"
+            )
+        except Exception:
+            return False
+
+    async def _ensure_schedule_ready(self, bet: dict):
+        await self.safe_goto(self._base_origin() + "/v2/#/schedule")
+        await asyncio.sleep(1.5)
+        if await self._has_schedule_lines():
+            return
+
+        # Fresh sessions may need league selection before lines render.
+        await self.safe_goto(self._base_origin() + "/v2/#/sports")
+        await asyncio.sleep(1.5)
+        await self._dismiss_overlays()
+
+        sport = (bet.get("sport") or "").lower()
+        labels = []
+        if "basket" in sport:
+            labels = ["NBA - Playoffs", "NBA"]
+        elif "football" in sport:
+            labels = ["NFL", "NCAAF", "Football"]
+        elif "baseball" in sport:
+            labels = ["MLB", "Baseball"]
+        elif "hockey" in sport:
+            labels = ["NHL", "Hockey"]
+        elif "soccer" in sport:
+            labels = ["Soccer"]
+
+        for label in labels:
+            try:
+                item = self.page.get_by_text(label, exact=False).first
+                if await item.is_visible(timeout=1000):
+                    await item.click()
+                    await asyncio.sleep(0.2)
+            except Exception:
+                pass
+            try:
+                chk = self.page.get_by_role("checkbox", name=label).first
+                if await chk.is_visible(timeout=1000):
+                    await chk.check(force=True)
+            except Exception:
+                pass
+
+        try:
+            cont = self.page.get_by_role("button", name=re.compile("CONTINUE", re.I)).first
+            if await cont.is_visible(timeout=2000):
+                await cont.click()
+                await asyncio.sleep(1.2)
+        except Exception:
+            pass
+
+        await self.safe_goto(self._base_origin() + "/v2/#/schedule")
+        try:
+            upd = self.page.get_by_role("button", name=re.compile("UPDATE", re.I)).first
+            if await upd.is_visible(timeout=1500):
+                await upd.click()
+        except Exception:
+            pass
+        await asyncio.sleep(1.2)
+
     async def search_bets(self, bet: dict) -> list[dict]:
         if not self.is_logged_in:
             logger.warning(f"[{self.PLATFORM_NAME}] Not logged in")
             return []
 
-        results = []
+        results: list[dict] = []
         try:
-            # Load main sports page
-            sports_url = self._base_origin() + "/v2/#/sports"
-            await self.safe_goto(sports_url)
-            # Wait for event links to appear instead of fixed sleep
-            try:
-                await self.page.wait_for_selector(
-                    "a[href*='schedule'], a[href*='evId']", timeout=10000
-                )
-            except Exception:
-                await asyncio.sleep(5)  # fallback
+            await self._ensure_schedule_ready(bet)
+            if not await self._has_schedule_lines():
+                logger.warning(f"[{self.PLATFORM_NAME}] Schedule has no visible odds lines")
+                return []
             await self._dismiss_overlays()
 
-            # Find all game event links on the page
-            event_links = await self.page.query_selector_all("a[href*='schedule'], a[href*='evId']")
-            logger.info(f"[{self.PLATFORM_NAME}] Found {len(event_links)} event links on main page")
+            payload = {
+                "event": bet.get("event", ""),
+                "marketKey": self._market_key(bet),
+                "includeDropdown": True,
+            }
 
-            event_filter = bet.get("event", "").lower()
-            matched_links = []
-            unmatched_links = []
+            scraped = await self.page.evaluate(
+                """
+                async (input) => {
+                  const norm = (s) => (s || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+                  const toDecimal = (am) => {
+                    const n = Number.parseInt(am, 10);
+                    if (!Number.isFinite(n) || n === 0) return null;
+                    return n > 0 ? Number((n / 100 + 1).toFixed(3)) : Number((100 / Math.abs(n) + 1).toFixed(3));
+                  };
+                  const americanFromJuice = (s) => {
+                    const m = (s || "").match(/-?\\d{3,4}/);
+                    return m ? Number.parseInt(m[0], 10) : null;
+                  };
+                  const parseEntry = (token, juiceToken, gameTitle, teamName) => {
+                    const t = (token || "").replace(/\\s+/g, "").trim();
+                    if (!t) return null;
+                    const juice = americanFromJuice(juiceToken);
 
-            for link in event_links[:50]:
-                try:
-                    text = (await link.inner_text()).strip()
-                    href = await link.get_attribute("href") or ""
-                    if not text or not href:
-                        continue
+                    if (/^[ou]\\d+(?:\\.\\d+|\\u00bd)?$/i.test(t)) {
+                      const side = t[0].toLowerCase() === "o" ? "Over" : "Under";
+                      const line = t.slice(1).replace(/\\u00bd/g, ".5");
+                      const selection = `${side} ${line}`;
+                      return {
+                        event: gameTitle,
+                        market: "Total",
+                        selection,
+                        odds_american: juice,
+                        odds: toDecimal(juice),
+                      };
+                    }
+                    if (/^[+-]\\d+(?:\\.\\d+|\\u00bd)?$/.test(t)) {
+                      if (Math.abs(Number.parseInt(t, 10)) >= 100) {
+                        const am = Number.parseInt(t, 10);
+                        return {
+                          event: gameTitle,
+                          market: "Moneyline",
+                          selection: teamName,
+                          odds_american: am,
+                          odds: toDecimal(am),
+                        };
+                      }
+                      return {
+                        event: gameTitle,
+                        market: "Spread",
+                        selection: `${teamName} ${t.replace(/\\u00bd/g, ".5")}`,
+                        odds_american: juice,
+                        odds: toDecimal(juice),
+                      };
+                    }
+                    return null;
+                  };
 
-                    # Check if this event text matches the bet we're looking for
-                    if event_filter:
-                        words = [w for w in event_filter.split() if len(w) > 3]
-                        if words and any(w in text.lower() for w in words):
-                            matched_links.append((text, href))
-                        else:
-                            unmatched_links.append((text, href))
-                    else:
-                        matched_links.append((text, href))
-                except Exception:
-                    pass
+                  const linesRaw = (document.body?.innerText || "").split(/\\r?\\n/).map((s) => s.trim()).filter(Boolean);
+                  const lines = [];
+                  for (let i = 0; i < linesRaw.length; i++) {
+                    const cur = linesRaw[i];
+                    const nxt = linesRaw[i + 1];
+                    if (nxt && /^\\d{1,2}:\\d{2}[ap](?:m)?\\s*ET$/i.test(cur) && /^Playoffs\\b/i.test(nxt)) {
+                      lines.push(`${cur} ${nxt}`.replace(/\\s+/g, " ").trim());
+                      i += 1;
+                      continue;
+                    }
+                    lines.push(cur);
+                  }
 
-            # Use matched links first; fall back to first 3 unmatched if no specific match
-            links_to_check = matched_links if matched_links else unmatched_links[:3]
+                  const dayHeader = /^(Sunday|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday)\\b.+\\bPlayoffs\\s*$/i;
+                  const gameStart = (line) => line.includes("@") && /Playoffs/i.test(line) && /\\d{1,2}:\\d{2}[ap](?:m)?/i.test(line);
+                  const games = [];
+                  let day = "";
+                  for (let i = 0; i < lines.length; i++) {
+                    const line = lines[i];
+                    if (dayHeader.test(line)) {
+                      day = line;
+                      continue;
+                    }
+                    if (!gameStart(line)) continue;
+                    const teams = [];
+                    let j = i + 1;
+                    while (j < lines.length) {
+                      const p = lines[j];
+                      if (dayHeader.test(p) || gameStart(p)) break;
+                      if (/^\\d{3}$/.test(p) && j + 1 < lines.length) {
+                        const row = { rotation: p, name: lines[j + 1], prices: [] };
+                        let k = j + 2;
+                        while (k < lines.length) {
+                          const x = lines[k];
+                          if (
+                            /^\\d{3}$/.test(x) ||
+                            dayHeader.test(x) ||
+                            gameStart(x) ||
+                            x === "UPDATE" ||
+                            x === "LOGOUT" ||
+                            x === "IF BET" ||
+                            x.startsWith("ID:") ||
+                            /^ACTION\\s+REVERSE$/i.test(x)
+                          ) break;
+                          row.prices.push(x);
+                          k += 1;
+                        }
+                        teams.push(row);
+                        j = k;
+                        continue;
+                      }
+                      j += 1;
+                    }
+                    games.push({ day, title: line, teams });
+                  }
 
-            # Click into each matched event to get full odds
-            for event_text, event_href in links_to_check[:5]:
-                try:
-                    event_url = self._base_origin() + "/v2/" + event_href
-                    await self.safe_goto(event_url)
-                    # Wait for odds to appear on the event page
-                    try:
-                        await self.page.wait_for_function(
-                            "() => document.body.innerText.match(/[+-]\\d{3,4}/)", timeout=6000
-                        )
-                    except Exception:
-                        await asyncio.sleep(4)
+                  const words = norm(input.event).split(" ").filter((w) => w.length > 2);
+                  const scored = games.map((g) => {
+                    const hay = norm(`${g.title} ${g.teams.map((t) => t.name).join(" ")}`);
+                    const score = words.length ? words.filter((w) => hay.includes(w)).length : 1;
+                    return { game: g, score };
+                  });
+                  scored.sort((a, b) => b.score - a.score);
+                  const selectedGames = scored.filter((x) => x.score > 0).slice(0, 2).map((x) => x.game);
 
-                    # Scrape odds from the event page
-                    page_text = await self.page.inner_text("body")
-                    american_odds = re.findall(r'([+-]\d{3,4})', page_text)
-                    decimal_odds = re.findall(r'(\b[12]\.\d{2,3}\b)', page_text)
+                  const out = [];
+                  for (const g of selectedGames) {
+                    for (const t of g.teams) {
+                      for (let i = 0; i < t.prices.length; i++) {
+                        const token = t.prices[i];
+                        const juice = i + 1 < t.prices.length ? t.prices[i + 1] : "";
+                        const parsed = parseEntry(token, juice, g.title, t.name);
+                        if (!parsed) continue;
+                        if (input.marketKey) {
+                          const mk = parsed.market.toLowerCase().replace(" ", "_");
+                          if (mk !== input.marketKey) continue;
+                        }
+                        out.push(parsed);
+                      }
+                    }
+                  }
 
-                    for odd_str in (american_odds + decimal_odds)[:10]:
-                        val = self.normalize_odds(odd_str)
-                        if val and 1.05 < val < 30:
-                            results.append({
-                                "event": event_text.replace("\n", " ").strip()[:80],
-                                "sport": bet.get("sport", ""),
-                                "market": bet.get("market", ""),
-                                "selection": "",
-                                "odds": val,
-                                "url": self.page.url,
-                            })
-                            break
+                  if (input.includeDropdown && selectedGames.length) {
+                    const target = selectedGames[0];
+                    for (const team of target.teams) {
+                      const teamNorm = norm(team.name);
+                      const leaf = Array.from(document.querySelectorAll("*")).find((el) => {
+                        if (!el || el.children.length !== 0) return false;
+                        return norm(el.textContent || "") === teamNorm;
+                      });
+                      if (!leaf) continue;
+                      let row = leaf;
+                      for (let depth = 0; depth < 8 && row; depth++) {
+                        if (row.querySelectorAll && row.querySelectorAll("ng-select").length) break;
+                        row = row.parentElement;
+                      }
+                      if (!row || !row.querySelectorAll) continue;
 
-                    logger.info(f"[{self.PLATFORM_NAME}] Event {event_text.strip()[:40]!r}: {len(american_odds)} American + {len(decimal_odds)} decimal odds")
+                      const selects = Array.from(row.querySelectorAll("ng-select"));
+                      for (const sel of selects) {
+                        const current = (sel.textContent || "").replace(/\\s+/g, "").trim();
+                        const isTotal = /^[x\\u00d7]?[ou]\\d/i.test(current);
+                        const isSpread = /^[x\\u00d7]?[+-]\\d/.test(current);
+                        if (!isTotal && !isSpread) continue;
+                        if (input.marketKey === "total" && !isTotal) continue;
+                        if (input.marketKey === "spread" && !isSpread) continue;
 
-                except Exception as e:
-                    logger.debug(f"[{self.PLATFORM_NAME}] Error on event {event_text!r}: {e}")
+                        const clickTarget = sel.querySelector(".ng-arrow-wrapper,.ng-select-container,.ng-arrow") || sel;
+                        clickTarget.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true, view: window }));
+                        clickTarget.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, view: window }));
+                        await new Promise((r) => setTimeout(r, 250));
+
+                        const panel = document.querySelector(".ng-dropdown-panel,[role='listbox']");
+                        if (!panel) continue;
+                        const options = Array.from(panel.querySelectorAll(".ng-option,[role='option']")).map((o) =>
+                          (o.textContent || "").replace(/\\s+/g, "").trim()
+                        );
+
+                        for (const opt of options) {
+                          const m = opt.match(/^([ou]\\d+(?:\\.\\d+|\\u00bd)?|[+-]\\d+(?:\\.\\d+|\\u00bd)?)\\((-?\\d{3,4})\\)$/i);
+                          if (!m) continue;
+                          const parsed = parseEntry(m[1], m[2], target.title, team.name);
+                          if (!parsed) continue;
+                          if (input.marketKey) {
+                            const mk = parsed.market.toLowerCase().replace(" ", "_");
+                            if (mk !== input.marketKey) continue;
+                          }
+                          out.push(parsed);
+                        }
+
+                        document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+                        await new Promise((r) => setTimeout(r, 100));
+                      }
+                    }
+                  }
+
+                  const dedup = new Set();
+                  const unique = [];
+                  for (const item of out) {
+                    const key = [
+                      item.event || "",
+                      item.market || "",
+                      item.selection || "",
+                      item.odds_american ?? "",
+                    ].join("|");
+                    if (dedup.has(key)) continue;
+                    dedup.add(key);
+                    unique.push(item);
+                  }
+
+                  return {
+                    selectedCount: selectedGames.length,
+                    candidateCount: unique.length,
+                    candidates: unique,
+                  };
+                }
+                """,
+                payload,
+            )
+
+            for c in (scraped or {}).get("candidates", []):
+                odds_american = c.get("odds_american")
+                odds_decimal = c.get("odds")
+                if odds_decimal is None and odds_american is not None:
+                    odds_decimal = self.normalize_odds(str(odds_american))
+                if odds_decimal is None and odds_american is None:
+                    continue
+                results.append(
+                    {
+                        "event": c.get("event", "")[:120],
+                        "sport": bet.get("sport", ""),
+                        "market": c.get("market", ""),
+                        "selection": c.get("selection", ""),
+                        "odds_american": odds_american,
+                        "odds": odds_decimal,
+                        "url": self.page.url,
+                    }
+                )
+
+            logger.info(
+                f"[{self.PLATFORM_NAME}] Schedule scrape returned "
+                f"{(scraped or {}).get('candidateCount', 0)} candidate odds"
+            )
 
         except Exception as e:
             logger.error(f"[{self.PLATFORM_NAME}] Search error: {e}")
