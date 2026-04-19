@@ -5,7 +5,7 @@ Supports /status and /help commands via Telegram.
 
 Speed architecture:
   - One persistent browser session per platform (login once at startup)
-  - All platforms searched in PARALLEL for each new bet (~15s vs ~3min)
+  - All platforms search concurrently; Telegram notifies as each book finishes (fastest first)
   - Sessions auto-refresh on expiry
 """
 
@@ -117,7 +117,82 @@ def get_enabled_platforms(config: dict) -> list[str]:
     ]
 
 
-# ─── Core search — parallel across all platforms ──────────────────────────────
+PLATFORM_LABELS = {
+    "smash66": "Smash66",
+    "diamondsb": "DiamondSB",
+    "sports411": "Sports411 (proxy)",
+    "leftcoast797": "Leftcoast797",
+}
+
+
+# ─── Core search — concurrent per-platform tasks, Telegram as each finishes ─
+
+async def process_one_platform(
+    platform_name: str,
+    bet: dict,
+    pool: PlatformPool,
+    notifier: TelegramNotifier,
+    matcher: BetMatcher,
+    all_open_bets: list[dict],
+    agent_cfg: dict,
+) -> tuple[int, int]:
+    """
+    Search one book, send match Telegrams immediately, then send “book done”.
+    Returns (matcher_hits, alerts_sent) for this platform only.
+    """
+    notify_exact = agent_cfg.get("notify_on_exact", True)
+    notify_similar = agent_cfg.get("notify_on_similar", True)
+    label = PLATFORM_LABELS.get(platform_name, platform_name)
+    t0 = time.time()
+    matcher_hits = 0
+    alerts_sent = 0
+    num_candidates = 0
+    error_msg = None
+    try:
+        candidates = await pool._search_one(platform_name, bet)
+        candidates = candidates or []
+        num_candidates = len(candidates)
+        matches = matcher.filter_results(bet, candidates) if candidates else []
+        console.print(
+            f"  [{platform_name}] {num_candidates} candidates → "
+            f"[yellow]{len(matches)} matches[/yellow] "
+            f"([dim]{time.time() - t0:.1f}s[/dim])"
+        )
+        for match in matches:
+            matcher_hits += 1
+            score = match["similarity_score"]
+            if is_hedge(all_open_bets, match, same_account=True):
+                console.print("    [dim]↳ hedge detected, skipping[/dim]")
+                continue
+            tag = "EXACT" if match["is_exact"] else f"SIMILAR ({score:.0f}%)"
+            console.print(
+                f"    [bold green]{tag}[/bold green] on [bold]{platform_name}[/bold]: "
+                f"{match.get('event', '?')[:50]} | odds={match.get('odds')}"
+            )
+            if match["is_exact"] and notify_exact:
+                await notifier.notify_exact_match(platform_name, bet, match)
+                alerts_sent += 1
+            elif match["is_similar"] and not match["is_exact"] and notify_similar:
+                await notifier.notify_similar_match(platform_name, bet, match, score)
+                alerts_sent += 1
+    except Exception as e:
+        error_msg = f"{type(e).__name__}: {e}"
+        logger.exception(
+            "Platform %s failed for ticket %s", platform_name, bet.get("ticket_id")
+        )
+    finally:
+        elapsed = time.time() - t0
+        await notifier.notify_platform_search_done(
+            label,
+            bet,
+            num_candidates,
+            matcher_hits,
+            alerts_sent,
+            elapsed,
+            error=error_msg,
+        )
+    return matcher_hits, alerts_sent
+
 
 async def process_bet(
     bet: dict,
@@ -128,59 +203,38 @@ async def process_bet(
     state: AgentState,
     cfg: dict,
 ) -> tuple[int, int]:
-    """Returns (matcher_hits, telegram_alerts_sent)."""
+    """Runs all platform searches concurrently; Telegram fires as each completes."""
     agent_cfg = cfg.get("agent", {})
-    notify_exact = agent_cfg.get("notify_on_exact", True)
-    notify_similar = agent_cfg.get("notify_on_similar", True)
-    matcher_hits = 0
-    alerts_sent = 0
-
     side_str = ""
     if bet.get("bet_side") and bet.get("line"):
         side_str = f" {bet['bet_side'].upper()} {bet['line']}"
     odds_str = str(bet.get("odds_american") or bet.get("odds") or "")
     console.print(
-        f"  [cyan]Searching:[/cyan] [{bet.get('sport','')}] [bold]{bet.get('event','?')[:55]}[/bold]"
+        f"  [cyan]Searching:[/cyan] [{bet.get('sport', '')}] [bold]{bet.get('event', '?')[:55]}[/bold]"
         f"{side_str}  odds={odds_str}  ticket={bet.get('ticket_id')}"
     )
 
-    t0 = time.time()
-    # Search ALL platforms in parallel — the big speed win
-    results_by_platform = await pool.search_all_parallel(bet)
-    elapsed = time.time() - t0
-    console.print(f"  [dim]Parallel search complete in {elapsed:.1f}s[/dim]")
+    platforms = pool.platform_names()
+    tasks = [
+        process_one_platform(
+            p, bet, pool, notifier, matcher, all_open_bets, agent_cfg
+        )
+        for p in platforms
+    ]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
 
-    for platform_name, candidates in results_by_platform.items():
-        if not candidates:
+    matcher_hits_total = 0
+    alerts_total = 0
+    for r in results:
+        if isinstance(r, Exception):
+            logger.error("Platform task error: %s", r)
             continue
+        mh, al = r
+        matcher_hits_total += mh
+        alerts_total += al
 
-        matches = matcher.filter_results(bet, candidates)
-        console.print(f"  [{platform_name}] {len(candidates)} candidates → [yellow]{len(matches)} matches[/yellow]")
-
-        for match in matches:
-            matcher_hits += 1
-            score = match["similarity_score"]
-
-            if is_hedge(all_open_bets, match, same_account=True):
-                console.print(f"    [dim]↳ hedge detected, skipping[/dim]")
-                continue
-
-            label = "EXACT" if match["is_exact"] else f"SIMILAR ({score:.0f}%)"
-            console.print(
-                f"    [bold green]{label}[/bold green] on [bold]{platform_name}[/bold]: "
-                f"{match.get('event','?')[:50]} | odds={match.get('odds')}"
-            )
-
-            if match["is_exact"] and notify_exact:
-                await notifier.notify_exact_match(platform_name, bet, match)
-                state.total_matches_found += 1
-                alerts_sent += 1
-            elif match["is_similar"] and not match["is_exact"] and notify_similar:
-                await notifier.notify_similar_match(platform_name, bet, match, score)
-                state.total_matches_found += 1
-                alerts_sent += 1
-
-    return matcher_hits, alerts_sent
+    state.total_matches_found += alerts_total
+    return matcher_hits_total, alerts_total
 
 
 # ─── Main loop ────────────────────────────────────────────────────────────────
@@ -210,7 +264,7 @@ async def polling_loop(
         f"  Platforms ready: {', '.join(active)}\n"
         f"  ibetcoin poll interval: {interval}s\n"
         f"  Slippage: line±{agent_cfg['line_slippage']}pt, juice±{agent_cfg['juice_slippage']}\n"
-        f"  Search mode: [bold cyan]PARALLEL[/bold cyan] (all platforms at once)\n"
+        f"  Search mode: [bold cyan]concurrent[/bold cyan] — Telegram as each book finishes\n"
     )
     state.platforms_enabled = active
     await notifier.notify_agent_started(active)
@@ -232,12 +286,10 @@ async def polling_loop(
             console.print("[dim]No new bets to process[/dim]")
         else:
             await notifier.notify_new_bets_found(new_bets)
-            searched = pool.platform_names()
 
             for bet in new_bets:
-                t_search = time.time()
                 try:
-                    matcher_hits, alerts_sent = await process_bet(
+                    matcher_hits, _alerts_sent = await process_bet(
                         bet, pool, notifier, matcher, all_bets, state, config
                     )
                 except Exception as e:
@@ -247,12 +299,9 @@ async def polling_loop(
                     await notifier.notify_bet_search_error(bet, err_msg)
                     continue
 
-                elapsed = time.time() - t_search
                 if matcher_hits == 0:
-                    console.print("  [dim]No matches found on any platform[/dim]")
-                await notifier.notify_bet_search_complete(
-                    bet, alerts_sent, matcher_hits, elapsed, searched
-                )
+                    console.print("  [dim]No matcher hits on any platform[/dim]")
+                # Per-platform completion messages already sent to Telegram
 
         console.print(f"[dim]Next check in {interval}s...[/dim]")
         await asyncio.sleep(interval)
@@ -264,7 +313,7 @@ async def main():
     _start_health_server()
     console.print(Panel.fit(
         "[bold cyan]Bet Finder Agent[/bold cyan]\n"
-        "[dim]ibetcoin.win → parallel platform search → Telegram alerts[/dim]",
+        "[dim]ibetcoin.win → per-book search + incremental Telegram[/dim]",
         border_style="cyan"
     ))
 

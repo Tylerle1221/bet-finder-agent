@@ -176,8 +176,50 @@ class TelegramNotifier:
             )
         if len(bets) > 5:
             lines.append(f"  ...and {len(bets)-5} more")
-        lines.append("\nSearching platforms now...")
+        lines.append(
+            "\nEach book is searched on its own session — you’ll get a Telegram "
+            "message <b>as each site finishes</b> (fastest first)."
+        )
         return await self.send_message("\n".join(lines))
+
+    async def notify_platform_search_done(
+        self,
+        platform_label: str,
+        bet: dict,
+        num_candidates: int,
+        matcher_hits: int,
+        alerts_sent: int,
+        elapsed_sec: float,
+        error: Optional[str] = None,
+    ) -> bool:
+        """One message when a single platform’s search + matching is finished."""
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        tid = bet.get("ticket_id", "?")
+        sport = bet.get("sport", "")
+        ev = (bet.get("event") or bet.get("selection") or "?")[:45]
+        if error:
+            body = (
+                f"🏁 <b>{platform_label}</b> — ticket <code>#{tid}</code>\n"
+                f"⏰ {ts}  |  ⏱ {elapsed_sec:.1f}s\n"
+                f"❌ <pre>{error[:400]}</pre>"
+            )
+            return await self.send_message(body)
+        cand = f"{num_candidates} candidate line(s)" if num_candidates else "no lines scraped"
+        if alerts_sent > 0:
+            tail = f"🎯 <b>{alerts_sent}</b> alert(s) sent (see above). [{cand}]"
+        elif matcher_hits > 0:
+            tail = (
+                f"ℹ️ {matcher_hits} match(es) after rules but <b>no alert</b> "
+                f"(hedge/filter). [{cand}]"
+            )
+        else:
+            tail = f"No matching line here. [{cand}]"
+        body = (
+            f"🏁 <b>{platform_label}</b> done — <code>#{tid}</code>\n"
+            f"⏰ {ts}  |  ⏱ {elapsed_sec:.1f}s\n"
+            f"[{sport}] {ev}\n{tail}"
+        )
+        return await self.send_message(body)
 
     async def notify_bet_search_complete(
         self,
