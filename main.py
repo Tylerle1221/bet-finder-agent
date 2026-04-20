@@ -225,7 +225,9 @@ async def process_one_platform(
         for match in matches:
             matcher_hits += 1
             score = match["similarity_score"]
-            if is_hedge(all_open_bets, match, same_account=True):
+            # Hedge check must use the original incoming bet fields (side/line/event),
+            # not only the matched book row.
+            if is_hedge(all_open_bets, bet, same_account=True):
                 console.print("    [dim]-> hedge detected, skipping[/dim]")
                 continue
             tag = "EXACT" if match["is_exact"] else f"SIMILAR ({score:.0f}%)"
