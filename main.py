@@ -114,6 +114,7 @@ def load_config() -> dict:
     a.setdefault("juice_slippage", 20)
     a.setdefault("notify_on_exact", True)
     a.setdefault("notify_on_similar", True)
+    a.setdefault("report_only_mode", True)
     a.setdefault("auto_submit_enabled", False)
     a.setdefault("auto_submit_exact_only", False)
     a.setdefault("auto_submit_stake", 25.0)
@@ -123,6 +124,7 @@ def load_config() -> dict:
     a.setdefault("submit_confirm_passwords", {})
 
     a["auto_submit_enabled"] = _env_bool("AUTO_SUBMIT_ENABLED", a["auto_submit_enabled"])
+    a["report_only_mode"] = _env_bool("REPORT_ONLY_MODE", a["report_only_mode"])
     a["auto_submit_exact_only"] = _env_bool("AUTO_SUBMIT_EXACT_ONLY", a["auto_submit_exact_only"])
     a["auto_submit_dry_run"] = _env_bool("AUTO_SUBMIT_DRY_RUN", a["auto_submit_dry_run"])
     if os.environ.get("AUTO_SUBMIT_STAKE"):
@@ -149,6 +151,8 @@ def load_config() -> dict:
         if os.environ.get(env_name):
             pw_map[k] = os.environ[env_name]
     a["submit_confirm_passwords"] = pw_map
+    if a["report_only_mode"]:
+        a["auto_submit_enabled"] = False
     return cfg
 
 
@@ -198,7 +202,8 @@ async def process_one_platform(
     """
     notify_exact = agent_cfg.get("notify_on_exact", True)
     notify_similar = agent_cfg.get("notify_on_similar", True)
-    auto_submit_enabled = bool(agent_cfg.get("auto_submit_enabled", False))
+    report_only_mode = bool(agent_cfg.get("report_only_mode", True))
+    auto_submit_enabled = bool(agent_cfg.get("auto_submit_enabled", False)) and not report_only_mode
     auto_submit_exact_only = bool(agent_cfg.get("auto_submit_exact_only", False))
     submit_stake = float(agent_cfg.get("auto_submit_stake", 25.0) or 25.0)
     submit_max_risk = float(agent_cfg.get("auto_submit_max_risk", 50.0) or 50.0)
@@ -366,6 +371,7 @@ async def polling_loop(
         f"  Platforms ready: {', '.join(active)}\n"
         f"  ibetcoin poll interval: {interval}s\n"
         f"  Slippage: line±{agent_cfg['line_slippage']}pt, juice±{agent_cfg['juice_slippage']}\n"
+        f"  Report-only mode: {agent_cfg.get('report_only_mode', True)}\n"
         f"  Auto-submit: {agent_cfg.get('auto_submit_enabled', False)} "
         f"(stake={agent_cfg.get('auto_submit_stake', 25)}, "
         f"max_risk={agent_cfg.get('auto_submit_max_risk', 50)}, "

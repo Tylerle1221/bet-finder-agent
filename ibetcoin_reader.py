@@ -21,7 +21,8 @@ LINE_RE = re.compile(
 )  # handles "u173", "u221½-105", and "OVER 216"
 SPREAD_RE = re.compile(r'([+-]\d+(?:\.\d+)?)')
 TICKET_RE = re.compile(r'Ticket\s*#?(\d+)', re.IGNORECASE)
-RISK_WIN_RE = re.compile(r'(\d[\d,]*)\s*/\s*(\d[\d,]*)')
+BRACKET_ID_RE = re.compile(r'\[(\d{2,})\]')
+RISK_WIN_RE = re.compile(r'\$?(\d[\d,]*(?:\.\d+)?)\s*/\s*\$?(\d[\d,]*(?:\.\d+)?)')
 PROP_HINT_RE = re.compile(
     r'\b(GET|PTS|POINTS|REB|ASSIST|ASSISTS|THREES|3PT|FIRST BASKET|RACE TO|PLAYER|TEAM TOTAL)\b',
     re.I,
@@ -81,13 +82,23 @@ def _parse_risk_win(text: str) -> tuple[float, float]:
 
 def parse_bet_row(row_text: str) -> Optional[OpenBet]:
     """Parse a single OpenBets table row into an OpenBet object."""
-    if not row_text or "Ticket" not in row_text:
+    if not row_text:
         return None
 
     bet = OpenBet()
     bet.raw_description = row_text
 
-    lines = [l.strip() for l in row_text.replace("\t", "\n").split("\n") if l.strip()]
+    normalized = (
+        row_text.replace("\u00a0", " ")
+        .replace("½", ".5")
+        .replace("Â½", ".5")
+        .replace("?", ".5")
+    )
+    # Some report rows are compact (single line). Add split points for known tokens.
+    normalized = re.sub(r'(?<!\n)(STRAIGHT\s+BET)', r'\n\1', normalized, flags=re.I)
+    normalized = re.sub(r'(?<!\n)(Ticket\s*#?\d+)', r'\n\1', normalized, flags=re.I)
+    normalized = re.sub(r'\s+', ' ', normalized).strip()
+    lines = [l.strip() for l in normalized.replace("\t", "\n").split("\n") if l.strip()]
 
     # Ticket ID
     for part in lines:
@@ -95,6 +106,10 @@ def parse_bet_row(row_text: str) -> Optional[OpenBet]:
         if m:
             bet.ticket_id = m.group(1)
             break
+    if not bet.ticket_id:
+        m = BRACKET_ID_RE.search(normalized)
+        if m:
+            bet.ticket_id = f"B{m.group(1)}"
 
     # Risk / Win (last numbers)
     risk_win_line = lines[-1] if lines else ""
@@ -123,8 +138,12 @@ def parse_bet_row(row_text: str) -> Optional[OpenBet]:
                     if rest:
                         bet.event = rest
 
-    # Description parsing — look for lines with [ ] bracket selections
+    # Description parsing — prefer line with [id], else fall back to straight-bet line.
     bracket_lines = [l for l in lines if re.search(r'\[\d+\]', l)]
+    if not bracket_lines:
+        bracket_lines = [l for l in lines if re.search(r'\bSTRAIGHT\s+BET\b', l, re.I)]
+    if not bracket_lines and lines:
+        bracket_lines = [max(lines, key=len)]
     if bracket_lines:
         desc_line = bracket_lines[0]
         # Normalize fractional markers before ASCII cleanup.
@@ -150,7 +169,17 @@ def parse_bet_row(row_text: str) -> Optional[OpenBet]:
         # Remove American odds even when glued to text, e.g. "u221½-105 (....)"
         clean = re.sub(r'[+-]\d{3,4}(?=\D|$)', '', clean).strip()
         # Remove descriptor prefixes so selection keeps only the actionable market text.
-        clean = re.sub(r'^\s*STRAIGHT\s+BET(?:\s+[A-Z]{2,6})?\s*', '', clean, flags=re.I)
+        clean = re.sub(
+            r'^\s*STRAIGHT\s+BET(?:\s+(?:NFL|NBA|MLB|NHL|NCAA|PROP|SOCCER|TENNIS|BASKETBALL|FOOTBALL|BASEBALL|HOCKEY|MMA|GOLF|BOXING))?\s*',
+            '',
+            clean,
+            flags=re.I,
+        )
+        # Remove compact front-matter often present before bracket id in report rows.
+        clean = re.sub(r'^\s*(?:[A-Za-z]{3}\s+\d{1,2}\s+\d{1,2}:\d{2}\s*[AP]M)?\s*', '', clean, flags=re.I)
+        clean = re.sub(r'^\s*MU\s*', '', clean, flags=re.I)
+        clean = re.sub(r'^[\-\:\s]+', '', clean)
+        clean = re.sub(r'\s+', ' ', clean).strip()
         bet.selection = clean.strip()
 
         # Detect Over/Under — handles both "OVER 216" and "u173" (no space)
@@ -165,15 +194,38 @@ def parse_bet_row(row_text: str) -> Optional[OpenBet]:
                 pass
             bet.market = f"Total {side.title()} {bet.line}"
         else:
-            spread_m = SPREAD_RE.search(clean)
-            if spread_m:
-                bet.market = "Spread"
-            else:
+            if re.search(r'\bML\b|\bMONEY\s*LINE\b', clean, re.I):
                 bet.market = "Moneyline"
-
+            elif PROP_HINT_RE.search(clean):
+                bet.market = "Prop"
+            else:
+                # Spread looks like +8.5/-1.5 (not pure 3-4 digit juice).
+                spread_num = re.search(r'(?<!\d)([+-]\d+(?:\.\d+)?)(?!\d)', clean)
+                if spread_num and abs(float(spread_num.group(1))) < 100:
+                    bet.market = "Spread"
+                else:
+                    bet.market = "Moneyline"
         # Detect prop-style markets (e.g. "GET 30PTS 1ST +200 ...")
         if PROP_HINT_RE.search(clean):
             bet.market = "Prop"
+
+        # If we still have no american odds parsed, retry against full row text.
+        if bet.odds_american is None:
+            odds_m = AMERICAN_ODDS_RE.search(normalized)
+            if odds_m:
+                bet.odds_american = int(odds_m.group(1))
+                bet.odds_decimal = _american_to_decimal(bet.odds_american)
+
+        # If no sport parsed from structured columns, infer from raw row text.
+        if not bet.sport:
+            s = (normalized or "").upper()
+            for token in ("NFL", "NBA", "MLB", "NHL", "NCAA", "SOCCER", "TENNIS", "GOLF", "MMA", "BOXING"):
+                if token in s:
+                    bet.sport = token
+                    break
+
+        if not bet.sport and PROP_HINT_RE.search(clean):
+            bet.sport = "PROP"
 
     # Event: extract team names from the bracket description (handles "vrs", "vs", "@")
     if not bet.event and bet.selection:
@@ -202,7 +254,7 @@ def parse_bet_row(row_text: str) -> Optional[OpenBet]:
 
     # Last fallback for compact straight bets without opponent in text.
     if bet.event and re.search(r'\bSTRAIGHT\s+BET\b', bet.event, re.I):
-        m_team = re.search(r'([A-Z][A-Z\s\.-]{2,})\s+[+-]\d', bet.selection, re.I)
+        m_team = re.search(r'([A-Z0-9][A-Z0-9\s,\.\'-]{2,})\s+[+-]\d', bet.selection, re.I)
         if m_team:
             bet.event = m_team.group(1).strip()
 

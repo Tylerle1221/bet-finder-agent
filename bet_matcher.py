@@ -102,6 +102,13 @@ class BetMatcher:
             str(candidate.get("market", "")),
         ])
         cand_side, cand_line = _extract_line(cand_text)
+        if candidate.get("bet_side") in ("over", "under"):
+            cand_side = str(candidate.get("bet_side")).lower()
+        if candidate.get("line") is not None:
+            try:
+                cand_line = float(candidate.get("line"))
+            except Exception:
+                pass
 
         # Event text similarity
         event_score = self._score_text(target.get("event", ""), candidate.get("event", ""))
@@ -119,7 +126,8 @@ class BetMatcher:
         line_ok = self._line_within_slippage(target_side, target_line, cand_line)
         juice_ok = self._juice_ok(target, candidate)
 
-        if not line_ok:
+        # A moved line or moved juice outside threshold is treated as non-actionable.
+        if not line_ok or not juice_ok:
             return False, False, 0.0
 
         # Calculate similarity score
@@ -127,7 +135,7 @@ class BetMatcher:
         line_score = max(0, 100 - line_diff * 50)  # lose 50pts per point of slip
         combined = event_score * 0.5 + line_score * 0.5
 
-        is_exact = (cand_line == target_line and event_score >= 90 and juice_ok)
+        is_exact = (cand_line == target_line and event_score >= 90)
         is_similar = combined >= self.similarity_threshold
 
         return is_exact, is_similar, round(combined, 1)

@@ -41,6 +41,8 @@
       - key: SIMILARITY_THRESHOLD
         value: "75"
       - key: AUTO_SUBMIT_ENABLED
+        value: "false"
+      - key: REPORT_ONLY_MODE
         value: "true"
       - key: AUTO_SUBMIT_EXACT_ONLY
         value: "false"
