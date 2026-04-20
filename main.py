@@ -355,6 +355,7 @@ async def polling_loop(
 ):
     agent_cfg = config.get("agent", {})
     ibet = config.get("ibetcoin", {})
+    configured_platforms = get_enabled_platforms(config)
 
     matcher = BetMatcher(
         similarity_threshold=agent_cfg.get("similarity_threshold", 75),
@@ -383,6 +384,15 @@ async def polling_loop(
     await notifier.notify_agent_started(active)
 
     while True:
+        # Keep process alive on transient platform outages and retry logins.
+        if not pool.platform_names() and configured_platforms:
+            console.print("[yellow]No active platform sessions. Retrying logins...[/yellow]")
+            try:
+                await pool.initialize(configured_platforms)
+            except Exception as e:
+                logger.warning("Platform re-initialize failed: %s", e)
+            state.platforms_enabled = pool.platform_names()
+
         state.total_cycles += 1
         from datetime import datetime, timezone
         state.last_cycle_at = datetime.now(timezone.utc)
@@ -465,7 +475,10 @@ async def main():
     console.print(f"[dim]Starting browsers and logging in to {len(enabled_platforms)} platforms...[/dim]")
     ok = await pool.initialize(enabled_platforms)
     if ok == 0:
-        console.print("[red]All platform logins failed.[/red]"); sys.exit(1)
+        console.print(
+            "[yellow]No platform logged in at startup. "
+            "Agent will stay online and retry logins each cycle.[/yellow]"
+        )
 
     # Give the status command access to real session data
     state.pool = pool
