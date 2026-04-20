@@ -14,8 +14,11 @@ from playwright.async_api import async_playwright, Page
 logger = logging.getLogger(__name__)
 
 OPENBETS_URL = "https://reports.ibetcoin.win/Report/OpenBets.aspx"
-AMERICAN_ODDS_RE = re.compile(r'([+-]\d{3,4})\s*$')
-LINE_RE = re.compile(r'(OVER|UNDER|O|U)\s*(\d+\.?\d*)', re.IGNORECASE)  # handles "u173" and "OVER 216"
+AMERICAN_ODDS_RE = re.compile(r'([+-]\d{3,4})(?=\D|$)')
+LINE_RE = re.compile(
+    r'(OVER|UNDER|O|U)\s*(\d+(?:\.\d+|[½?])?)(?:\s*[+-]\d{3,4})?',
+    re.IGNORECASE,
+)  # handles "u173", "u221½-105", and "OVER 216"
 SPREAD_RE = re.compile(r'([+-]\d+\.?\d*)\s*$')
 TICKET_RE = re.compile(r'Ticket\s*#?(\d+)', re.IGNORECASE)
 RISK_WIN_RE = re.compile(r'(\d[\d,]*)\s*/\s*(\d[\d,]*)')
@@ -120,7 +123,14 @@ def parse_bet_row(row_text: str) -> Optional[OpenBet]:
     bracket_lines = [l for l in lines if re.search(r'\[\d+\]', l)]
     if bracket_lines:
         desc_line = bracket_lines[0]
-        # Strip non-ASCII / corrupt unicode chars that can appear between odds parts
+        # Normalize fractional markers before ASCII cleanup.
+        desc_line = (
+            desc_line
+            .replace("½", ".5")
+            .replace("Â½", ".5")
+            .replace("?", ".5")
+        )
+        # Strip remaining non-ASCII / corrupt unicode chars that can appear between odds parts
         desc_clean_raw = re.sub(r'[^\x00-\x7F]+', ' ', desc_line).strip()
         bet.raw_description = desc_clean_raw
 
@@ -133,7 +143,8 @@ def parse_bet_row(row_text: str) -> Optional[OpenBet]:
 
         # Strip the bracket ID and odds from description for clean text
         clean = re.sub(r'\[\d+\]', '', desc_clean_raw)
-        clean = re.sub(r'[+-]\d{3,4}(?:\s|$)', '', clean).strip()
+        # Remove American odds even when glued to text, e.g. "u221½-105 (....)"
+        clean = re.sub(r'[+-]\d{3,4}(?=\D|$)', '', clean).strip()
         bet.selection = clean
 
         # Detect Over/Under — handles both "OVER 216" and "u173" (no space)
@@ -142,7 +153,8 @@ def parse_bet_row(row_text: str) -> Optional[OpenBet]:
             side = line_m.group(1).upper()
             bet.bet_side = "over" if side in ("OVER", "O") else "under"
             try:
-                bet.line = float(line_m.group(2))
+                line_txt = line_m.group(2).replace("½", ".5").replace("?", ".5")
+                bet.line = float(line_txt)
             except ValueError:
                 pass
             bet.market = f"Total {side.title()} {bet.line}"

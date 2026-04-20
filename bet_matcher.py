@@ -15,7 +15,10 @@ from rapidfuzz import fuzz
 
 logger = logging.getLogger(__name__)
 
-LINE_RE = re.compile(r'(OVER|UNDER|O|U)\s+(\d+\.?\d*)', re.IGNORECASE)
+LINE_RE = re.compile(
+    r'(OVER|UNDER|O|U)\s*(\d+(?:\.\d+|[½?])?)(?:\s*[+-]\d{3,4})?',
+    re.IGNORECASE,
+)
 AMERICAN_ODDS_RE = re.compile(r'([+-]\d{3,4})')
 SPREAD_RE = re.compile(r'([+-]\d+\.?\d*)\s+[(-]?\d{2,3}')
 
@@ -26,7 +29,8 @@ def _extract_line(text: str) -> tuple[Optional[str], Optional[float]]:
     if m:
         side = m.group(1).upper()
         side_str = "over" if side in ("OVER", "O") else "under"
-        return side_str, float(m.group(2))
+        line_txt = m.group(2).replace("½", ".5").replace("?", ".5")
+        return side_str, float(line_txt)
     return None, None
 
 
