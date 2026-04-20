@@ -37,13 +37,13 @@
       - key: LEFTCOAST797_PASSWORD
         value: "kk22"
       - key: CHECK_INTERVAL
-        value: "120"
+        value: "45"
       - key: SIMILARITY_THRESHOLD
         value: "75"
       - key: LOW_MEMORY_MODE
         value: "true"
       - key: IDLE_SHUTDOWN_CYCLES
-        value: "1"
+        value: "3"
       - key: AUTO_SUBMIT_ENABLED
         value: "false"
       - key: REPORT_ONLY_MODE

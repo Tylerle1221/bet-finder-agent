@@ -123,7 +123,7 @@ def load_config() -> dict:
     a.setdefault("notify_on_similar", True)
     a.setdefault("report_only_mode", True)
     a.setdefault("low_memory_mode", True)
-    a.setdefault("idle_shutdown_cycles", 1)
+    a.setdefault("idle_shutdown_cycles", 3)
     a.setdefault("auto_submit_enabled", False)
     a.setdefault("auto_submit_exact_only", False)
     a.setdefault("auto_submit_stake", 25.0)
@@ -410,7 +410,7 @@ async def polling_loop(
 
         console.print("[dim]Fetching open bets from ibetcoin.win...[/dim]")
         all_bets = await reader.fetch_open_bets()
-        new_bets = await reader.fetch_new_bets()
+        new_bets = reader.classify_new_bets(all_bets)
         state.total_bets_scraped += len(new_bets)
 
         console.print(f"[dim]Total open: {len(all_bets)} | New this cycle: {len(new_bets)}[/dim]")

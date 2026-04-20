@@ -307,6 +307,13 @@ class IbetcoinReader:
     async def fetch_new_bets(self) -> list[dict]:
         """Same as fetch_open_bets but filters out already-seen tickets."""
         all_bets = await self.fetch_open_bets()
+        return self.classify_new_bets(all_bets)
+
+    def classify_new_bets(self, all_bets: list[dict]) -> list[dict]:
+        """
+        Filter already-seen tickets from a pre-fetched open-bet list.
+        This avoids scraping the Open Bets page twice per cycle.
+        """
         new_bets = []
         for b in all_bets:
             tid = b.get("ticket_id", "")

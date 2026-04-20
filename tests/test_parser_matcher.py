@@ -1,7 +1,7 @@
 import unittest
 
 from bet_matcher import BetMatcher
-from ibetcoin_reader import parse_bet_row
+from ibetcoin_reader import IbetcoinReader, parse_bet_row
 
 
 class ParseBetRowTests(unittest.TestCase):
@@ -84,6 +84,19 @@ class BetMatcherSlippageTests(unittest.TestCase):
         is_exact, is_similar, _score = self.matcher.match(self.target, candidate)
         self.assertFalse(is_exact)
         self.assertFalse(is_similar)
+
+
+class IbetcoinReaderStateTests(unittest.TestCase):
+    def test_classify_new_bets_tracks_seen_ticket_ids(self):
+        reader = IbetcoinReader(username="u", password="p", headless=True)
+        first = reader.classify_new_bets(
+            [{"ticket_id": "A1"}, {"ticket_id": "A2"}, {"ticket_id": "A1"}]
+        )
+        second = reader.classify_new_bets(
+            [{"ticket_id": "A1"}, {"ticket_id": "A2"}, {"ticket_id": "A3"}]
+        )
+        self.assertEqual([b["ticket_id"] for b in first], ["A1", "A2"])
+        self.assertEqual([b["ticket_id"] for b in second], ["A3"])
 
 
 if __name__ == "__main__":

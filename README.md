@@ -23,13 +23,13 @@ In this mode, the agent only reports available matches to Telegram and never sub
 To reduce hosting RAM/GB usage:
 
 - `LOW_MEMORY_MODE=true`
-- `IDLE_SHUTDOWN_CYCLES=1`
+- `IDLE_SHUTDOWN_CYCLES=3`
 
 Behavior:
 
 - Platform browsers are not kept open all the time.
 - Browsers start only when new ibet open bets appear.
-- If a cycle has no new bets, browser sessions are closed after the configured idle cycle count.
+- If cycles stay idle, browser sessions are closed after the configured idle cycle count.
 
 ## Match rules
 
