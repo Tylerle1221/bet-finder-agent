@@ -86,6 +86,83 @@ class V2SportsScraper(BasePlatformScraper):
             return "moneyline"
         return ""
 
+    def _is_prop_bet(self, bet: dict) -> bool:
+        m = (bet.get("market") or "").lower()
+        s = (bet.get("selection") or "").lower()
+        e = (bet.get("event") or "").lower()
+        hints = ("get ", "pts", "points", "reb", "assist", "threes", "first", "race to", "player")
+        return "prop" in m or any(h in s for h in hints) or any(h in e for h in hints)
+
+    async def _search_props(self, bet: dict) -> list[dict]:
+        """Best-effort prop extraction by opening +Props links and scanning text+odds."""
+        payload = {"event": bet.get("event", ""), "selection": bet.get("selection", "")}
+        raw = await self.page.evaluate(
+            """
+            async (input) => {
+              const norm = (s) => (s || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+              const tokens = norm(`${input.event} ${input.selection}`).split(" ").filter(w => w.length > 2);
+              const out = [];
+
+              const propButtons = Array.from(document.querySelectorAll("a,button,span,div"))
+                .filter(el => /\+\d+\s*props/i.test((el.textContent || "").trim()))
+                .slice(0, 4);
+
+              for (const btn of propButtons) {
+                try {
+                  btn.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, view: window }));
+                  await new Promise(r => setTimeout(r, 900));
+                } catch {}
+
+                const lines = (document.body?.innerText || "").split(/\\r?\\n/).map(s => s.trim()).filter(Boolean);
+                for (const line of lines) {
+                  const low = norm(line);
+                  const score = tokens.length ? tokens.filter(t => low.includes(t)).length : 0;
+                  if (score < Math.max(1, Math.floor(tokens.length * 0.35))) continue;
+                  const am = line.match(/([+-]\\d{3,4})/);
+                  if (!am) continue;
+                  out.push({
+                    event: input.event || "",
+                    market: "Prop",
+                    selection: line.slice(0, 140),
+                    odds_american: Number.parseInt(am[1], 10),
+                  });
+                }
+                document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+                await new Promise(r => setTimeout(r, 120));
+              }
+
+              const dedup = new Set();
+              const uniq = [];
+              for (const x of out) {
+                const k = `${x.selection}|${x.odds_american}`;
+                if (dedup.has(k)) continue;
+                dedup.add(k);
+                uniq.push(x);
+              }
+              return uniq;
+            }
+            """,
+            payload,
+        )
+        rows = []
+        for c in raw or []:
+            am = c.get("odds_american")
+            dec = self.normalize_odds(str(am)) if am is not None else None
+            if dec is None:
+                continue
+            rows.append(
+                {
+                    "event": (c.get("event") or "")[:120],
+                    "sport": bet.get("sport", ""),
+                    "market": "Prop",
+                    "selection": c.get("selection", ""),
+                    "odds_american": am,
+                    "odds": dec,
+                    "url": self.page.url,
+                }
+            )
+        return rows
+
     async def _has_schedule_lines(self) -> bool:
         try:
             return await self.page.evaluate(
@@ -399,6 +476,9 @@ class V2SportsScraper(BasePlatformScraper):
                         "url": self.page.url,
                     }
                 )
+
+            if self._is_prop_bet(bet):
+                results.extend(await self._search_props(bet))
 
             logger.info(
                 f"[{self.PLATFORM_NAME}] Schedule scrape returned "

@@ -177,6 +177,13 @@ class Sports411Scraper(BasePlatformScraper):
             return "SOCCER"
         return s.upper() if s else "BASKETBALL"
 
+    def _is_prop_bet(self, bet: dict) -> bool:
+        m = (bet.get("market") or "").lower()
+        s = (bet.get("selection") or "").lower()
+        e = (bet.get("event") or "").lower()
+        hints = ("get ", "pts", "points", "reb", "assist", "threes", "first", "race to", "player")
+        return "prop" in m or any(h in s for h in hints) or any(h in e for h in hints)
+
     def _league_labels(self, bet: dict) -> list[str]:
         sport = (bet.get("sport") or "").lower()
         event = (bet.get("event") or "").lower()
@@ -359,6 +366,69 @@ class Sports411Scraper(BasePlatformScraper):
             out.append(x)
         return out
 
+    async def _search_props(self, bet: dict) -> list[dict]:
+        payload = {"event": bet.get("event", ""), "selection": bet.get("selection", "")}
+        raw = await self.page.evaluate(
+            """
+            async (input) => {
+              const norm = (s) => (s || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+              const tokens = norm(`${input.event} ${input.selection}`).split(" ").filter(w => w.length > 2);
+              const out = [];
+
+              const propEls = Array.from(document.querySelectorAll("a,button,span,div"))
+                .filter(el => /\+\d+\s*props|\\bprops\\b|\\bmore\\b/i.test((el.textContent || "").trim()))
+                .slice(0, 8);
+
+              for (const el of propEls) {
+                try {
+                  el.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, view: window }));
+                  await new Promise(r => setTimeout(r, 800));
+                } catch {}
+                const lines = (document.body?.innerText || "").split(/\\r?\\n/).map(s => s.trim()).filter(Boolean);
+                for (const line of lines) {
+                  const low = norm(line);
+                  const score = tokens.length ? tokens.filter(t => low.includes(t)).length : 0;
+                  if (score < Math.max(1, Math.floor(tokens.length * 0.35))) continue;
+                  const am = line.match(/([+-]\\d{3,4})/);
+                  if (!am) continue;
+                  out.push({ event: input.event || "", market: "Prop", selection: line.slice(0, 160), odds_american: Number.parseInt(am[1], 10) });
+                }
+                document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+                await new Promise(r => setTimeout(r, 100));
+              }
+
+              const dedup = new Set();
+              const uniq = [];
+              for (const x of out) {
+                const k = `${x.selection}|${x.odds_american}`;
+                if (dedup.has(k)) continue;
+                dedup.add(k);
+                uniq.push(x);
+              }
+              return uniq;
+            }
+            """,
+            payload,
+        )
+        rows = []
+        for c in raw or []:
+            am = c.get("odds_american")
+            dec = self.normalize_odds(str(am)) if am is not None else None
+            if dec is None:
+                continue
+            rows.append(
+                {
+                    "event": (c.get("event") or "")[:120],
+                    "sport": bet.get("sport", ""),
+                    "market": "Prop",
+                    "selection": c.get("selection", ""),
+                    "odds_american": am,
+                    "odds": dec,
+                    "url": self.page.url,
+                }
+            )
+        return rows
+
     async def search_bets(self, bet: dict) -> list[dict]:
         if not self.is_logged_in:
             logger.warning(f"[{self.PLATFORM_NAME}] Not logged in")
@@ -377,6 +447,8 @@ class Sports411Scraper(BasePlatformScraper):
                 await self._dismiss_overlays()
                 body = await self.page.locator("body").inner_text()
                 scraped = self._parse_board_candidates(body, bet)
+            if self._is_prop_bet(bet):
+                scraped.extend(await self._search_props(bet))
 
             for c in scraped:
                 am = c.get("odds_american")

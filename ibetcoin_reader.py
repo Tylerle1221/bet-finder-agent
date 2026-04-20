@@ -22,6 +22,10 @@ LINE_RE = re.compile(
 SPREAD_RE = re.compile(r'([+-]\d+(?:\.\d+)?)')
 TICKET_RE = re.compile(r'Ticket\s*#?(\d+)', re.IGNORECASE)
 RISK_WIN_RE = re.compile(r'(\d[\d,]*)\s*/\s*(\d[\d,]*)')
+PROP_HINT_RE = re.compile(
+    r'\b(GET|PTS|POINTS|REB|ASSIST|ASSISTS|THREES|3PT|FIRST BASKET|RACE TO|PLAYER|TEAM TOTAL)\b',
+    re.I,
+)
 
 
 @dataclass
@@ -145,7 +149,9 @@ def parse_bet_row(row_text: str) -> Optional[OpenBet]:
         clean = re.sub(r'\[\d+\]', '', desc_clean_raw)
         # Remove American odds even when glued to text, e.g. "u221½-105 (....)"
         clean = re.sub(r'[+-]\d{3,4}(?=\D|$)', '', clean).strip()
-        bet.selection = clean
+        # Remove descriptor prefixes so selection keeps only the actionable market text.
+        clean = re.sub(r'^\s*STRAIGHT\s+BET(?:\s+[A-Z]{2,6})?\s*', '', clean, flags=re.I)
+        bet.selection = clean.strip()
 
         # Detect Over/Under — handles both "OVER 216" and "u173" (no space)
         line_m = LINE_RE.search(clean)
@@ -165,6 +171,10 @@ def parse_bet_row(row_text: str) -> Optional[OpenBet]:
             else:
                 bet.market = "Moneyline"
 
+        # Detect prop-style markets (e.g. "GET 30PTS 1ST +200 ...")
+        if PROP_HINT_RE.search(clean):
+            bet.market = "Prop"
+
     # Event: extract team names from the bracket description (handles "vrs", "vs", "@")
     if not bet.event and bet.selection:
         # Look for team match pattern inside parentheses: (TEAM1 vrs/vs/@ TEAM2) (League)
@@ -180,6 +190,8 @@ def parse_bet_row(row_text: str) -> Optional[OpenBet]:
     
     if not bet.event:
         for l in lines:
+            if re.search(r'\bSTRAIGHT\s+BET\b', l, re.I):
+                continue
             if re.search(r'\s+(vrs?|vs\.?|@|at)\s+', l, re.I) or re.search(r'[A-Z]{2,}\s+[A-Z]{2,}', l):
                 bet.event = re.sub(r'\bvrs?\b', 'vs', l, flags=re.I)
                 break
@@ -187,6 +199,12 @@ def parse_bet_row(row_text: str) -> Optional[OpenBet]:
     # Fallback: use raw description as event
     if not bet.event and bet.raw_description:
         bet.event = re.sub(r'\[\d+\].*', '', bet.raw_description).strip()
+
+    # Last fallback for compact straight bets without opponent in text.
+    if bet.event and re.search(r'\bSTRAIGHT\s+BET\b', bet.event, re.I):
+        m_team = re.search(r'([A-Z][A-Z\s\.-]{2,})\s+[+-]\d', bet.selection, re.I)
+        if m_team:
+            bet.event = m_team.group(1).strip()
 
     return bet if bet.ticket_id else None
 
