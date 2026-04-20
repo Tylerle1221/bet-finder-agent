@@ -227,6 +227,111 @@ class V2SportsScraper(BasePlatformScraper):
             pass
         await asyncio.sleep(1.2)
 
+    async def submit_bet(
+        self,
+        bet: dict,
+        matched: dict | None = None,
+        stake: float = 25.0,
+        max_risk: float = 50.0,
+        confirm_password: str = "",
+        dry_run: bool = False,
+    ) -> dict:
+        if not self.is_logged_in:
+            return {"success": False, "status": "not_logged_in", "platform": self.PLATFORM_NAME}
+        try:
+            await self._ensure_schedule_ready(bet)
+            await self._dismiss_overlays()
+            if not await self._has_schedule_lines():
+                return {"success": False, "status": "no_schedule_lines", "platform": self.PLATFORM_NAME}
+
+            event_text = (matched or {}).get("event") or bet.get("event", "")
+            tokens = self._submit_tokens(bet, matched or {})
+            clicked = await self._click_market_candidate(event_text, tokens, timeout_ms=4500)
+            if not clicked.get("ok"):
+                return {
+                    "success": False,
+                    "status": "odds_click_failed",
+                    "platform": self.PLATFORM_NAME,
+                    "tokens": tokens[:8],
+                }
+
+            # Some skins require opening bet slip first.
+            for text in ("VIEW BET SLIP", "View Bet Slip", "BET SLIP"):
+                try:
+                    loc = self.page.get_by_text(text, exact=False).first
+                    if await loc.count() and await loc.is_visible(timeout=350):
+                        try:
+                            await loc.click(timeout=700)
+                        except Exception:
+                            await loc.click(timeout=700, force=True)
+                        await asyncio.sleep(0.2)
+                        break
+                except Exception:
+                    pass
+
+            filled = await self._fill_stake_input(stake)
+            if not filled.get("ok"):
+                return {
+                    "success": False,
+                    "status": "stake_fill_failed",
+                    "platform": self.PLATFORM_NAME,
+                    "details": filled,
+                }
+
+            await asyncio.sleep(0.3)
+            total_risk = await self._read_total_risk()
+            if total_risk is not None:
+                if total_risk > max_risk + 0.01:
+                    return {
+                        "success": False,
+                        "status": "risk_above_limit",
+                        "platform": self.PLATFORM_NAME,
+                        "total_risk": total_risk,
+                    }
+                if total_risk < float(stake) - 0.01:
+                    return {
+                        "success": False,
+                        "status": "risk_below_target",
+                        "platform": self.PLATFORM_NAME,
+                        "total_risk": total_risk,
+                    }
+
+            # Some books ask confirm password, some don't.
+            _ = await self._fill_confirm_password(confirm_password or "")
+            if dry_run:
+                return {
+                    "success": True,
+                    "status": "dry_run_ready",
+                    "platform": self.PLATFORM_NAME,
+                    "clicked": clicked,
+                    "total_risk": total_risk,
+                }
+
+            submitted = await self._click_submit_button()
+            if not submitted:
+                return {
+                    "success": False,
+                    "status": "submit_button_not_found",
+                    "platform": self.PLATFORM_NAME,
+                    "total_risk": total_risk,
+                }
+
+            outcome = await self._await_submit_outcome(timeout_ms=12000)
+            return {
+                **outcome,
+                "platform": self.PLATFORM_NAME,
+                "clicked": clicked,
+                "total_risk": total_risk,
+            }
+        except Exception as e:
+            logger.error(f"[{self.PLATFORM_NAME}] Submit error: {e}")
+            return {
+                "success": False,
+                "status": "submit_exception",
+                "platform": self.PLATFORM_NAME,
+                "error": f"{type(e).__name__}: {e}",
+            }
+
     async def search_bets(self, bet: dict) -> list[dict]:
         if not self.is_logged_in:
             logger.warning(f"[{self.PLATFORM_NAME}] Not logged in")

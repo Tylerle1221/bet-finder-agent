@@ -40,3 +40,15 @@
         value: "60"
       - key: SIMILARITY_THRESHOLD
         value: "75"
+      - key: AUTO_SUBMIT_ENABLED
+        value: "true"
+      - key: AUTO_SUBMIT_EXACT_ONLY
+        value: "false"
+      - key: AUTO_SUBMIT_STAKE
+        value: "25"
+      - key: AUTO_SUBMIT_MAX_RISK
+        value: "50"
+      - key: AUTO_SUBMIT_DRY_RUN
+        value: "false"
+      - key: SUBMIT_CONFIRM_PASSWORD_DIAMONDSB
+        value: "222"

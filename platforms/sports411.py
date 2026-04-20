@@ -242,6 +242,82 @@ class Sports411Scraper(BasePlatformScraper):
 
         await asyncio.sleep(1.5)
 
+    async def _click_board_pick(self, event_text: str, tokens: list[str]) -> dict:
+        team_tokens = self._event_team_tokens(event_text)
+        try:
+            clicked = await self.page.evaluate(
+                """
+                ({tokens, teams}) => {
+                  const norm = (s) => (s || "").toLowerCase().replace(/\\s+/g, " ").trim();
+                  const toks = (tokens || []).map(norm).filter(Boolean);
+                  const nonOddsToks = toks.filter((t) => !/^[+-]\\d{3,4}$/.test(t));
+                  const tms = (teams || []).map(norm).filter(Boolean);
+                  const isVisible = (el) => {
+                    if (!el) return false;
+                    const st = getComputedStyle(el);
+                    if (!st || st.display === "none" || st.visibility === "hidden") return false;
+                    const r = el.getBoundingClientRect();
+                    return r.width > 4 && r.height > 4;
+                  };
+                  const clickEl = (el) => {
+                    el.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true, view: window }));
+                    el.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true, view: window }));
+                    el.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, view: window }));
+                  };
+
+                  const rows = Array.from(document.querySelectorAll("tr,[role='row'],.table-row,.odds-row,.line-row,div,td"));
+                  let best = null;
+                  for (const row of rows) {
+                    if (!isVisible(row)) continue;
+                    const rowTxt = norm(row.textContent || "");
+                    if (!rowTxt) continue;
+                    if (rowTxt.length > 500) continue;
+                    if (!toks.some((t) => rowTxt.includes(t))) continue;
+
+                    let p = row;
+                    let teamHits = 0;
+                    for (let depth = 0; depth < 8 && p; depth++) {
+                      const block = norm(p.textContent || "");
+                      if (block.length > 3000) {
+                        p = p.parentElement;
+                        continue;
+                      }
+                      for (const tm of tms) {
+                        if (tm && block.includes(tm)) teamHits += 1;
+                      }
+                      p = p.parentElement;
+                    }
+
+                    const leaves = [row, ...Array.from(row.querySelectorAll("a,button,span,div,td"))];
+                    for (const leaf of leaves) {
+                      if (!isVisible(leaf)) continue;
+                      if (leaf.children && leaf.children.length > 5) continue;
+                      const txt = norm(leaf.textContent || "");
+                      if (!txt || txt.length > 24) continue;
+                      if (!toks.some((t) => txt === t || txt.startsWith(t) || txt.includes(t))) continue;
+
+                      let score = 15;
+                      if (txt.length <= 10) score += 10;
+                      if (toks.some((t) => txt === t)) score += 18;
+                      if (nonOddsToks.some((t) => txt === t || txt.includes(t))) score += 18;
+                      if (/^[+-]\\d{3,4}$/.test(txt) && nonOddsToks.length) score -= 20;
+                      if (/^[ou]\\d/i.test(txt) || /^[+-]\\d{3,4}$/.test(txt)) score += 12;
+                      score += teamHits * 7;
+                      if (!best || score > best.score) best = { el: leaf, txt, score };
+                    }
+                  }
+                  if (!best) return { ok: false, reason: "no_pick_cell" };
+                  try { best.el.scrollIntoView({ block: "center", inline: "center" }); } catch {}
+                  clickEl(best.el);
+                  return { ok: true, text: best.txt, score: best.score };
+                }
+                """,
+                {"tokens": tokens, "teams": team_tokens},
+            )
+            return clicked or {"ok": False, "reason": "empty_result"}
+        except Exception as e:
+            return {"ok": False, "reason": f"js_error:{type(e).__name__}"}
+
     def _parse_board_candidates(self, body_text: str, bet: dict) -> list[dict]:
         lines = [x.strip() for x in (body_text or "").splitlines() if x.strip()]
         target_event = (bet.get("event") or "")
@@ -473,3 +549,130 @@ class Sports411Scraper(BasePlatformScraper):
             logger.error(f"[{self.PLATFORM_NAME}] Search error: {e}")
 
         return results
+
+    async def submit_bet(
+        self,
+        bet: dict,
+        matched: dict | None = None,
+        stake: float = 25.0,
+        max_risk: float = 50.0,
+        confirm_password: str = "",
+        dry_run: bool = False,
+    ) -> dict:
+        if not self.is_logged_in:
+            return {"success": False, "status": "not_logged_in", "platform": self.PLATFORM_NAME}
+        try:
+            await self._prepare_board(bet)
+            await self._dismiss_overlays()
+
+            event_text = (matched or {}).get("event") or bet.get("event", "")
+            tokens = self._submit_tokens(bet, matched or {})
+            clicked = await self._click_board_pick(event_text, tokens)
+            if not clicked.get("ok"):
+                # Retry once after forcing board prep again.
+                await self._prepare_board(bet)
+                await self._dismiss_overlays()
+                clicked = await self._click_board_pick(event_text, tokens)
+            if not clicked.get("ok"):
+                clicked = await self._click_market_candidate(event_text, tokens, timeout_ms=2500)
+            if not clicked.get("ok"):
+                # Last fallback: direct text click on compact token.
+                for t in tokens:
+                    if len(t) > 16:
+                        continue
+                    if await self._click_text(t):
+                        clicked = {"ok": True, "text": t, "score": 0}
+                        break
+            if not clicked.get("ok"):
+                return {
+                    "success": False,
+                    "status": "odds_click_failed",
+                    "platform": self.PLATFORM_NAME,
+                    "tokens": tokens[:8],
+                }
+
+            # Wait for right betslip panel to become non-empty.
+            slip_ready = False
+            for _ in range(16):
+                await asyncio.sleep(0.25)
+                try:
+                    txt = await self.page.locator("body").inner_text(timeout=1200)
+                except Exception:
+                    continue
+                low = txt.lower()
+                if "select any pick to start betting" not in low and "betslip" in low:
+                    slip_ready = True
+                    break
+            if not slip_ready:
+                return {
+                    "success": False,
+                    "status": "odds_not_added_to_betslip",
+                    "platform": self.PLATFORM_NAME,
+                    "clicked": clicked,
+                }
+
+            await asyncio.sleep(0.25)
+            filled = await self._fill_stake_input(stake)
+            if not filled.get("ok"):
+                return {
+                    "success": False,
+                    "status": "stake_fill_failed",
+                    "platform": self.PLATFORM_NAME,
+                    "details": filled,
+                }
+
+            await asyncio.sleep(0.3)
+            total_risk = await self._read_total_risk()
+            if total_risk is not None:
+                if total_risk > max_risk + 0.01:
+                    return {
+                        "success": False,
+                        "status": "risk_above_limit",
+                        "platform": self.PLATFORM_NAME,
+                        "total_risk": total_risk,
+                    }
+                if total_risk < float(stake) - 0.01:
+                    return {
+                        "success": False,
+                        "status": "risk_below_target",
+                        "platform": self.PLATFORM_NAME,
+                        "total_risk": total_risk,
+                    }
+
+            # Sports411 typically doesn't require extra confirm password but keep optional.
+            if confirm_password:
+                _ = await self._fill_confirm_password(confirm_password)
+
+            if dry_run:
+                return {
+                    "success": True,
+                    "status": "dry_run_ready",
+                    "platform": self.PLATFORM_NAME,
+                    "clicked": clicked,
+                    "total_risk": total_risk,
+                }
+
+            submitted = await self._click_submit_button()
+            if not submitted:
+                return {
+                    "success": False,
+                    "status": "submit_button_not_found",
+                    "platform": self.PLATFORM_NAME,
+                    "total_risk": total_risk,
+                }
+
+            outcome = await self._await_submit_outcome(timeout_ms=12000)
+            return {
+                **outcome,
+                "platform": self.PLATFORM_NAME,
+                "clicked": clicked,
+                "total_risk": total_risk,
+            }
+        except Exception as e:
+            logger.error(f"[{self.PLATFORM_NAME}] Submit error: {e}")
+            return {
+                "success": False,
+                "status": "submit_exception",
+                "platform": self.PLATFORM_NAME,
+                "error": f"{type(e).__name__}: {e}",
+            }

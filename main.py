@@ -43,6 +43,13 @@ console = Console()
 CONFIG_PATH = Path(__file__).parent / "config.json"
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    v = os.environ.get(name)
+    if v is None:
+        return default
+    return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
 # ─── Health server ────────────────────────────────────────────────────────────
 
 def _start_health_server():
@@ -107,6 +114,41 @@ def load_config() -> dict:
     a.setdefault("juice_slippage", 20)
     a.setdefault("notify_on_exact", True)
     a.setdefault("notify_on_similar", True)
+    a.setdefault("auto_submit_enabled", False)
+    a.setdefault("auto_submit_exact_only", False)
+    a.setdefault("auto_submit_stake", 25.0)
+    a.setdefault("auto_submit_max_risk", 50.0)
+    a.setdefault("auto_submit_dry_run", False)
+    a.setdefault("submit_confirm_password", "")
+    a.setdefault("submit_confirm_passwords", {})
+
+    a["auto_submit_enabled"] = _env_bool("AUTO_SUBMIT_ENABLED", a["auto_submit_enabled"])
+    a["auto_submit_exact_only"] = _env_bool("AUTO_SUBMIT_EXACT_ONLY", a["auto_submit_exact_only"])
+    a["auto_submit_dry_run"] = _env_bool("AUTO_SUBMIT_DRY_RUN", a["auto_submit_dry_run"])
+    if os.environ.get("AUTO_SUBMIT_STAKE"):
+        try:
+            a["auto_submit_stake"] = float(os.environ["AUTO_SUBMIT_STAKE"])
+        except Exception:
+            pass
+    if os.environ.get("AUTO_SUBMIT_MAX_RISK"):
+        try:
+            a["auto_submit_max_risk"] = float(os.environ["AUTO_SUBMIT_MAX_RISK"])
+        except Exception:
+            pass
+    if os.environ.get("SUBMIT_CONFIRM_PASSWORD"):
+        a["submit_confirm_password"] = os.environ["SUBMIT_CONFIRM_PASSWORD"]
+
+    per_book_env = {
+        "smash66": "SUBMIT_CONFIRM_PASSWORD_SMASH66",
+        "diamondsb": "SUBMIT_CONFIRM_PASSWORD_DIAMONDSB",
+        "sports411": "SUBMIT_CONFIRM_PASSWORD_SPORTS411",
+        "leftcoast797": "SUBMIT_CONFIRM_PASSWORD_LEFTCOAST797",
+    }
+    pw_map = dict(a.get("submit_confirm_passwords") or {})
+    for k, env_name in per_book_env.items():
+        if os.environ.get(env_name):
+            pw_map[k] = os.environ[env_name]
+    a["submit_confirm_passwords"] = pw_map
     return cfg
 
 
@@ -125,6 +167,19 @@ PLATFORM_LABELS = {
 }
 
 
+def _confirm_password_for(config: dict, platform_name: str) -> str:
+    agent_cfg = config.get("agent", {})
+    per_book = agent_cfg.get("submit_confirm_passwords") or {}
+    if per_book.get(platform_name):
+        return str(per_book.get(platform_name))
+    if agent_cfg.get("submit_confirm_password"):
+        return str(agent_cfg.get("submit_confirm_password"))
+    platform_cfg = config.get("platforms", {}).get(platform_name, {})
+    if platform_cfg.get("confirm_password"):
+        return str(platform_cfg.get("confirm_password"))
+    return ""
+
+
 # ─── Core search — concurrent per-platform tasks, Telegram as each finishes ─
 
 async def process_one_platform(
@@ -135,17 +190,25 @@ async def process_one_platform(
     matcher: BetMatcher,
     all_open_bets: list[dict],
     agent_cfg: dict,
-) -> tuple[int, int]:
+    config: dict,
+) -> tuple[int, int, int, int]:
     """
     Search one book, send match Telegrams immediately, then send “book done”.
-    Returns (matcher_hits, alerts_sent) for this platform only.
+    Returns (matcher_hits, alerts_sent, submit_attempts, submit_success) for this platform.
     """
     notify_exact = agent_cfg.get("notify_on_exact", True)
     notify_similar = agent_cfg.get("notify_on_similar", True)
+    auto_submit_enabled = bool(agent_cfg.get("auto_submit_enabled", False))
+    auto_submit_exact_only = bool(agent_cfg.get("auto_submit_exact_only", False))
+    submit_stake = float(agent_cfg.get("auto_submit_stake", 25.0) or 25.0)
+    submit_max_risk = float(agent_cfg.get("auto_submit_max_risk", 50.0) or 50.0)
+    submit_dry_run = bool(agent_cfg.get("auto_submit_dry_run", False))
     label = PLATFORM_LABELS.get(platform_name, platform_name)
     t0 = time.time()
     matcher_hits = 0
     alerts_sent = 0
+    submit_attempts = 0
+    submit_success = 0
     num_candidates = 0
     error_msg = None
     try:
@@ -154,15 +217,16 @@ async def process_one_platform(
         num_candidates = len(candidates)
         matches = matcher.filter_results(bet, candidates) if candidates else []
         console.print(
-            f"  [{platform_name}] {num_candidates} candidates → "
+            f"  [{platform_name}] {num_candidates} candidates -> "
             f"[yellow]{len(matches)} matches[/yellow] "
             f"([dim]{time.time() - t0:.1f}s[/dim])"
         )
+        submit_candidate = None
         for match in matches:
             matcher_hits += 1
             score = match["similarity_score"]
             if is_hedge(all_open_bets, match, same_account=True):
-                console.print("    [dim]↳ hedge detected, skipping[/dim]")
+                console.print("    [dim]-> hedge detected, skipping[/dim]")
                 continue
             tag = "EXACT" if match["is_exact"] else f"SIMILAR ({score:.0f}%)"
             console.print(
@@ -175,6 +239,36 @@ async def process_one_platform(
             elif match["is_similar"] and not match["is_exact"] and notify_similar:
                 await notifier.notify_similar_match(platform_name, bet, match, score)
                 alerts_sent += 1
+
+            if submit_candidate is None:
+                if auto_submit_exact_only and not match["is_exact"]:
+                    pass
+                else:
+                    submit_candidate = match
+
+        if auto_submit_enabled and submit_candidate is not None:
+            submit_attempts += 1
+            confirm_password = _confirm_password_for(config, platform_name)
+            submit_result = await pool.submit_one(
+                name=platform_name,
+                bet=bet,
+                matched=submit_candidate,
+                stake=submit_stake,
+                max_risk=submit_max_risk,
+                confirm_password=confirm_password,
+                dry_run=submit_dry_run,
+            )
+            if submit_result.get("success"):
+                submit_success += 1
+            await notifier.notify_bet_submit_result(
+                platform=label,
+                bet=bet,
+                matched=submit_candidate,
+                submit_result=submit_result,
+                stake=submit_stake,
+                max_risk=submit_max_risk,
+                dry_run=submit_dry_run,
+            )
     except Exception as e:
         error_msg = f"{type(e).__name__}: {e}"
         logger.exception(
@@ -191,7 +285,7 @@ async def process_one_platform(
             elapsed,
             error=error_msg,
         )
-    return matcher_hits, alerts_sent
+    return matcher_hits, alerts_sent, submit_attempts, submit_success
 
 
 async def process_bet(
@@ -202,7 +296,7 @@ async def process_bet(
     all_open_bets: list[dict],
     state: AgentState,
     cfg: dict,
-) -> tuple[int, int]:
+) -> tuple[int, int, int, int]:
     """Runs all platform searches concurrently; Telegram fires as each completes."""
     agent_cfg = cfg.get("agent", {})
     side_str = ""
@@ -217,7 +311,7 @@ async def process_bet(
     platforms = pool.platform_names()
     tasks = [
         process_one_platform(
-            p, bet, pool, notifier, matcher, all_open_bets, agent_cfg
+            p, bet, pool, notifier, matcher, all_open_bets, agent_cfg, cfg
         )
         for p in platforms
     ]
@@ -225,16 +319,22 @@ async def process_bet(
 
     matcher_hits_total = 0
     alerts_total = 0
+    submit_attempts_total = 0
+    submit_success_total = 0
     for r in results:
         if isinstance(r, Exception):
             logger.error("Platform task error: %s", r)
             continue
-        mh, al = r
+        mh, al, sa, ss = r
         matcher_hits_total += mh
         alerts_total += al
+        submit_attempts_total += sa
+        submit_success_total += ss
 
     state.total_matches_found += alerts_total
-    return matcher_hits_total, alerts_total
+    state.total_submit_attempts += submit_attempts_total
+    state.total_submit_success += submit_success_total
+    return matcher_hits_total, alerts_total, submit_attempts_total, submit_success_total
 
 
 # ─── Main loop ────────────────────────────────────────────────────────────────
@@ -264,6 +364,11 @@ async def polling_loop(
         f"  Platforms ready: {', '.join(active)}\n"
         f"  ibetcoin poll interval: {interval}s\n"
         f"  Slippage: line±{agent_cfg['line_slippage']}pt, juice±{agent_cfg['juice_slippage']}\n"
+        f"  Auto-submit: {agent_cfg.get('auto_submit_enabled', False)} "
+        f"(stake={agent_cfg.get('auto_submit_stake', 25)}, "
+        f"max_risk={agent_cfg.get('auto_submit_max_risk', 50)}, "
+        f"exact_only={agent_cfg.get('auto_submit_exact_only', False)}, "
+        f"dry_run={agent_cfg.get('auto_submit_dry_run', False)})\n"
         f"  Search mode: [bold cyan]concurrent[/bold cyan] — Telegram as each book finishes\n"
     )
     state.platforms_enabled = active
@@ -289,7 +394,7 @@ async def polling_loop(
 
             for bet in new_bets:
                 try:
-                    matcher_hits, _alerts_sent = await process_bet(
+                    matcher_hits, _alerts_sent, submit_attempts, submit_success = await process_bet(
                         bet, pool, notifier, matcher, all_bets, state, config
                     )
                 except Exception as e:
@@ -301,6 +406,11 @@ async def polling_loop(
 
                 if matcher_hits == 0:
                     console.print("  [dim]No matcher hits on any platform[/dim]")
+                if submit_attempts > 0:
+                    console.print(
+                        f"  [magenta]Submit attempts:[/magenta] {submit_attempts} | "
+                        f"[green]success:[/green] {submit_success}"
+                    )
                 # Per-platform completion messages already sent to Telegram
 
         console.print(f"[dim]Next check in {interval}s...[/dim]")
@@ -313,7 +423,7 @@ async def main():
     _start_health_server()
     console.print(Panel.fit(
         "[bold cyan]Bet Finder Agent[/bold cyan]\n"
-        "[dim]ibetcoin.win → per-book search + incremental Telegram[/dim]",
+        "[dim]ibetcoin.win -> per-book search + incremental Telegram[/dim]",
         border_style="cyan"
     ))
 

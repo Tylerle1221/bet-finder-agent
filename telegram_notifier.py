@@ -29,6 +29,8 @@ class AgentState:
     total_cycles: int = 0
     total_bets_scraped: int = 0
     total_matches_found: int = 0
+    total_submit_attempts: int = 0
+    total_submit_success: int = 0
     last_error: str = ""
     platforms_enabled: list = field(default_factory=list)
     ibetcoin_url: str = "https://reports.ibetcoin.win/Report/OpenBets.aspx"
@@ -270,6 +272,36 @@ class TelegramNotifier:
             f"⏰ {ts}\n<pre>{error[:800]}</pre>"
         )
 
+    async def notify_bet_submit_result(
+        self,
+        platform: str,
+        bet: dict,
+        matched: dict,
+        submit_result: dict,
+        stake: float,
+        max_risk: float,
+        dry_run: bool,
+    ) -> bool:
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        tid = bet.get("ticket_id", "?")
+        status = submit_result.get("status", "unknown")
+        ok = bool(submit_result.get("success"))
+        total_risk = submit_result.get("total_risk")
+        risk_txt = f"{total_risk}" if total_risk is not None else "n/a"
+        title = "🧪 DRY-RUN submit" if dry_run else ("✅ Bet submitted" if ok else "⚠️ Submit failed")
+        msg = (
+            f"<b>{title}</b>\n\n"
+            f"⏰ {ts}  |  🏦 <b>{platform}</b>\n"
+            f"🎫 Ticket: <code>#{tid}</code>\n"
+            f"🎯 Match: {(matched.get('event') or bet.get('event') or '?')[:70]}\n"
+            f"🧾 Market: {matched.get('market', bet.get('market', '?'))} | {matched.get('selection', bet.get('selection', '?'))}\n"
+            f"💵 Stake: {stake} (max risk {max_risk}) | risk seen: {risk_txt}\n"
+            f"📌 Status: <b>{status}</b>"
+        )
+        if submit_result.get("error"):
+            msg += f"\n<pre>{str(submit_result.get('error'))[:500]}</pre>"
+        return await self.send_message(msg)
+
     async def test_connection(self) -> bool:
         return await self.send_message(
             "✅ <b>Bet Finder Agent - Connected</b>\n\n"
@@ -306,6 +338,8 @@ class TelegramCommandServer:
             f"🔄 <b>Cycles run:</b> {self.state.total_cycles}",
             f"📥 <b>Bets scraped:</b> {self.state.total_bets_scraped}",
             f"🎯 <b>Matches found:</b> {self.state.total_matches_found}",
+            f"🧾 <b>Submit attempts:</b> {self.state.total_submit_attempts}",
+            f"✅ <b>Submit success:</b> {self.state.total_submit_success}",
             f"🕐 <b>Last cycle:</b> {self.state.last_cycle_str}",
             f"",
             f"<b>Connection Health:</b>",

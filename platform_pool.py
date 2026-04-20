@@ -97,6 +97,53 @@ class PlatformPool:
                     logger.error(f"[Pool] {name} still failing after re-login: {e2}")
                 return []
 
+    async def submit_one(
+        self,
+        name: str,
+        bet: dict,
+        matched: dict,
+        stake: float,
+        max_risk: float,
+        confirm_password: str = "",
+        dry_run: bool = False,
+    ) -> dict:
+        """Submit one matched bet on a single platform with retry/re-login logic."""
+        scraper = self._scrapers.get(name)
+        if not scraper:
+            return {"success": False, "status": "platform_not_ready", "platform": name}
+
+        async with self._locks[name]:
+            try:
+                return await scraper.submit_bet(
+                    bet=bet,
+                    matched=matched,
+                    stake=stake,
+                    max_risk=max_risk,
+                    confirm_password=confirm_password,
+                    dry_run=dry_run,
+                )
+            except Exception as e:
+                logger.warning(f"[Pool] {name} submit error ({type(e).__name__}: {e}) — retrying after re-login...")
+                scraper.is_logged_in = False
+                try:
+                    if await scraper.login_with_retry(max_attempts=2):
+                        return await scraper.submit_bet(
+                            bet=bet,
+                            matched=matched,
+                            stake=stake,
+                            max_risk=max_risk,
+                            confirm_password=confirm_password,
+                            dry_run=dry_run,
+                        )
+                except Exception as e2:
+                    logger.error(f"[Pool] {name} still failing submit after re-login: {e2}")
+                return {
+                    "success": False,
+                    "status": "submit_failed_after_retry",
+                    "platform": getattr(scraper, "PLATFORM_NAME", name),
+                    "error": f"{type(e).__name__}: {e}",
+                }
+
     # ── Internal ──────────────────────────────────────────────────────────────
 
     async def _start_platform(self, name: str) -> bool:
