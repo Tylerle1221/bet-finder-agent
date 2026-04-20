@@ -18,6 +18,19 @@ This project now runs in **report-only mode** by default:
 
 In this mode, the agent only reports available matches to Telegram and never submits bets.
 
+## Low-memory mode (default)
+
+To reduce hosting RAM/GB usage:
+
+- `LOW_MEMORY_MODE=true`
+- `IDLE_SHUTDOWN_CYCLES=1`
+
+Behavior:
+
+- Platform browsers are not kept open all the time.
+- Browsers start only when new ibet open bets appear.
+- If a cycle has no new bets, browser sessions are closed after the configured idle cycle count.
+
 ## Match rules
 
 Totals use slippage-aware matching:

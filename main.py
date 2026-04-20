@@ -122,6 +122,8 @@ def load_config() -> dict:
     a.setdefault("notify_on_exact", True)
     a.setdefault("notify_on_similar", True)
     a.setdefault("report_only_mode", True)
+    a.setdefault("low_memory_mode", True)
+    a.setdefault("idle_shutdown_cycles", 1)
     a.setdefault("auto_submit_enabled", False)
     a.setdefault("auto_submit_exact_only", False)
     a.setdefault("auto_submit_stake", 25.0)
@@ -132,8 +134,14 @@ def load_config() -> dict:
 
     a["auto_submit_enabled"] = _env_bool("AUTO_SUBMIT_ENABLED", a["auto_submit_enabled"])
     a["report_only_mode"] = _env_bool("REPORT_ONLY_MODE", a["report_only_mode"])
+    a["low_memory_mode"] = _env_bool("LOW_MEMORY_MODE", a["low_memory_mode"])
     a["auto_submit_exact_only"] = _env_bool("AUTO_SUBMIT_EXACT_ONLY", a["auto_submit_exact_only"])
     a["auto_submit_dry_run"] = _env_bool("AUTO_SUBMIT_DRY_RUN", a["auto_submit_dry_run"])
+    if os.environ.get("IDLE_SHUTDOWN_CYCLES"):
+        try:
+            a["idle_shutdown_cycles"] = max(1, int(os.environ["IDLE_SHUTDOWN_CYCLES"]))
+        except Exception:
+            pass
     if os.environ.get("AUTO_SUBMIT_STAKE"):
         try:
             a["auto_submit_stake"] = float(os.environ["AUTO_SUBMIT_STAKE"])
@@ -361,8 +369,10 @@ async def polling_loop(
     reader: IbetcoinReader,
 ):
     agent_cfg = config.get("agent", {})
-    ibet = config.get("ibetcoin", {})
     configured_platforms = get_enabled_platforms(config)
+    low_memory_mode = bool(agent_cfg.get("low_memory_mode", True))
+    idle_shutdown_cycles = max(1, int(agent_cfg.get("idle_shutdown_cycles", 1) or 1))
+    idle_cycles = 0
 
     matcher = BetMatcher(
         similarity_threshold=agent_cfg.get("similarity_threshold", 75),
@@ -376,10 +386,12 @@ async def polling_loop(
 
     console.print(
         f"\n[bold green]Agent running[/bold green]\n"
-        f"  Platforms ready: {', '.join(active)}\n"
+        f"  Platforms configured: {', '.join(configured_platforms)}\n"
+        f"  Platforms active now: {', '.join(active) if active else '(none)'}\n"
         f"  ibetcoin poll interval: {interval}s\n"
         f"  Slippage: line±{agent_cfg['line_slippage']}pt, juice±{agent_cfg['juice_slippage']}\n"
         f"  Report-only mode: {agent_cfg.get('report_only_mode', True)}\n"
+        f"  Low-memory mode: {low_memory_mode} (idle shutdown after {idle_shutdown_cycles} cycle(s))\n"
         f"  Auto-submit: {agent_cfg.get('auto_submit_enabled', False)} "
         f"(stake={agent_cfg.get('auto_submit_stake', 25)}, "
         f"max_risk={agent_cfg.get('auto_submit_max_risk', 50)}, "
@@ -387,19 +399,10 @@ async def polling_loop(
         f"dry_run={agent_cfg.get('auto_submit_dry_run', False)})\n"
         f"  Search mode: [bold cyan]concurrent[/bold cyan] — Telegram as each book finishes\n"
     )
-    state.platforms_enabled = active
-    await notifier.notify_agent_started(active)
+    state.platforms_enabled = configured_platforms
+    await notifier.notify_agent_started(configured_platforms)
 
     while True:
-        # Keep process alive on transient platform outages and retry logins.
-        if not pool.platform_names() and configured_platforms:
-            console.print("[yellow]No active platform sessions. Retrying logins...[/yellow]")
-            try:
-                await pool.initialize(configured_platforms)
-            except Exception as e:
-                logger.warning("Platform re-initialize failed: %s", e)
-            state.platforms_enabled = pool.platform_names()
-
         state.total_cycles += 1
         from datetime import datetime, timezone
         state.last_cycle_at = datetime.now(timezone.utc)
@@ -414,7 +417,23 @@ async def polling_loop(
 
         if not new_bets:
             console.print("[dim]No new bets to process[/dim]")
+            if low_memory_mode and pool.platform_names():
+                idle_cycles += 1
+                if idle_cycles >= idle_shutdown_cycles:
+                    console.print("[dim]Low-memory: no new bets -> closing platform browsers[/dim]")
+                    await pool.shutdown()
+                    idle_cycles = 0
         else:
+            idle_cycles = 0
+            # Lazy platform startup: keep browser RAM near zero during idle cycles.
+            active_now = set(pool.platform_names())
+            missing = [p for p in configured_platforms if p not in active_now]
+            if missing:
+                console.print(f"[dim]Starting platform sessions on-demand: {', '.join(missing)}[/dim]")
+                try:
+                    await pool.initialize(missing)
+                except Exception as e:
+                    logger.warning("On-demand platform initialize failed: %s", e)
             await notifier.notify_new_bets_found(new_bets)
 
             for bet in new_bets:
@@ -477,15 +496,21 @@ async def main():
     # Start command listener
     await cmd_server.start()
 
-    # Initialize platform pool — login ONCE, keep browsers alive
+    # Initialize platform pool
     pool = PlatformPool(config)
-    console.print(f"[dim]Starting browsers and logging in to {len(enabled_platforms)} platforms...[/dim]")
-    ok = await pool.initialize(enabled_platforms)
-    if ok == 0:
+    agent_cfg = config.get("agent", {})
+    if agent_cfg.get("low_memory_mode", True):
         console.print(
-            "[yellow]No platform logged in at startup. "
-            "Agent will stay online and retry logins each cycle.[/yellow]"
+            "[dim]Low-memory mode enabled: platform browsers will start only when new bets arrive.[/dim]"
         )
+    else:
+        console.print(f"[dim]Starting browsers and logging in to {len(enabled_platforms)} platforms...[/dim]")
+        ok = await pool.initialize(enabled_platforms)
+        if ok == 0:
+            console.print(
+                "[yellow]No platform logged in at startup. "
+                "Agent will stay online and retry logins when needed.[/yellow]"
+            )
 
     # Give the status command access to real session data
     state.pool = pool
@@ -494,7 +519,6 @@ async def main():
     # This ensures we only process BRAND NEW bets from this point forward,
     # not the bets that were already sitting on ibetcoin.win when we started.
     ibet = config.get("ibetcoin", {})
-    agent_cfg = config.get("agent", {})
     reader = IbetcoinReader(
         username=ibet["username"],
         password=ibet["password"],
