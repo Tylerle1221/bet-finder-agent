@@ -74,8 +74,15 @@ def load_config() -> dict:
     cfg: dict = {"telegram": {}, "platforms": {}, "agent": {}, "ibetcoin": {}}
 
     if CONFIG_PATH.exists():
-        with open(CONFIG_PATH) as f:
-            cfg = json.load(f)
+        try:
+            with open(CONFIG_PATH, encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                cfg = loaded
+            else:
+                logger.warning("config.json is not a JSON object; using env/default config.")
+        except Exception as e:
+            logger.warning("Failed to parse config.json (%s); using env/default config.", e)
 
     if os.environ.get("TELEGRAM_BOT_TOKEN"):
         cfg.setdefault("telegram", {})["bot_token"] = os.environ["TELEGRAM_BOT_TOKEN"]

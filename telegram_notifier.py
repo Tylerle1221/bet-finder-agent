@@ -322,6 +322,7 @@ class TelegramCommandServer:
         self.allowed_chat_id = str(allowed_chat_id)
         self.state = state
         self._app: Optional[Application] = None
+        self._polling_enabled: bool = False
 
     def _is_allowed(self, update: Update) -> bool:
         return str(update.effective_chat.id) == self.allowed_chat_id
@@ -444,23 +445,45 @@ class TelegramCommandServer:
         Webhook mode would require a separate port or integration that conflicts
         with the health server on Render, so polling is used for reliability.
         """
-        self._app = Application.builder().token(self.bot_token).build()
-        self._app.add_handler(CommandHandler("status", self._cmd_status))
-        self._app.add_handler(CommandHandler("help", self._cmd_help))
-        self._app.add_error_handler(self._on_error)
+        try:
+            self._app = Application.builder().token(self.bot_token).build()
+            self._app.add_handler(CommandHandler("status", self._cmd_status))
+            self._app.add_handler(CommandHandler("help", self._cmd_help))
+            self._app.add_error_handler(self._on_error)
 
-        await self._app.initialize()
-        await self._app.start()
-        # Drop webhook if it was set — mixing webhook + polling causes API errors.
-        await self._app.bot.delete_webhook(drop_pending_updates=True)
-        await self._app.updater.start_polling(
-            drop_pending_updates=True,
-            allowed_updates=Update.ALL_TYPES,
-        )
-        logger.info("Telegram command server started (/status /help)")
+            await self._app.initialize()
+            await self._app.start()
+            # Drop webhook if it was set — mixing webhook + polling causes API errors.
+            await self._app.bot.delete_webhook(drop_pending_updates=True)
+            try:
+                await self._app.updater.start_polling(
+                    drop_pending_updates=True,
+                    allowed_updates=Update.ALL_TYPES,
+                )
+                self._polling_enabled = True
+                logger.info("Telegram command server started (/status /help)")
+            except Conflict as e:
+                self._polling_enabled = False
+                logger.warning(
+                    "Telegram command polling disabled due to getUpdates conflict: %s. "
+                    "Bet scraping/reporting remains active.",
+                    e,
+                )
+        except Exception as e:
+            self._polling_enabled = False
+            logger.error("Telegram command server failed to start: %s", e, exc_info=True)
+            try:
+                if self._app:
+                    await self._app.shutdown()
+            except Exception:
+                pass
+            self._app = None
 
     async def stop(self):
         if self._app:
-            await self._app.updater.stop()
-            await self._app.stop()
-            await self._app.shutdown()
+            try:
+                if self._polling_enabled:
+                    await self._app.updater.stop()
+                await self._app.stop()
+            finally:
+                await self._app.shutdown()
