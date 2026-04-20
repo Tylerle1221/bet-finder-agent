@@ -486,8 +486,10 @@ async def main():
         console.print("[red]No platforms enabled.[/red]"); sys.exit(1)
 
     state = AgentState()
-    notifier = TelegramNotifier(tg["bot_token"], tg["chat_id"])
-    cmd_server = TelegramCommandServer(tg["bot_token"], tg["chat_id"], state)
+    chat_id_raw = str(tg["chat_id"])
+    notify_chat_id = chat_id_raw.split(",")[0].strip()
+    notifier = TelegramNotifier(tg["bot_token"], notify_chat_id)
+    cmd_server = TelegramCommandServer(tg["bot_token"], chat_id_raw, state)
 
     # Test Telegram
     console.print("[dim]Testing Telegram...[/dim]")

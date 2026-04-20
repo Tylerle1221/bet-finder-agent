@@ -50,6 +50,7 @@ Set these environment variables (Render or local `.env`):
 
 - `IBETCOIN_USERNAME`, `IBETCOIN_PASSWORD`
 - `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`
+ - Optional: `TELEGRAM_ALLOW_ALL_COMMANDS=true` (recommended so `/status` and `/help` respond in any chat)
 - `SMASH66_USERNAME`, `SMASH66_PASSWORD`
 - `DIAMONDSB_USERNAME`, `DIAMONDSB_PASSWORD`
 - `SPORTS411_USERNAME`, `SPORTS411_PASSWORD`

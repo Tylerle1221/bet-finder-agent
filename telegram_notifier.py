@@ -319,16 +319,37 @@ class TelegramCommandServer:
 
     def __init__(self, bot_token: str, allowed_chat_id: str, state: AgentState):
         self.bot_token = bot_token
-        self.allowed_chat_id = str(allowed_chat_id)
+        raw = str(allowed_chat_id or "").strip()
+        self.allowed_chat_ids = {x.strip() for x in raw.split(",") if x.strip()}
+        self.allow_all_commands = str(
+            os.environ.get("TELEGRAM_ALLOW_ALL_COMMANDS", "true")
+        ).strip().lower() in {"1", "true", "yes", "y", "on"}
         self.state = state
         self._app: Optional[Application] = None
         self._polling_enabled: bool = False
 
     def _is_allowed(self, update: Update) -> bool:
-        return str(update.effective_chat.id) == self.allowed_chat_id
+        if self.allow_all_commands:
+            return True
+        chat_id = str(update.effective_chat.id)
+        user_id = str(update.effective_user.id) if update.effective_user else ""
+        return chat_id in self.allowed_chat_ids or user_id in self.allowed_chat_ids
+
+    async def _deny_if_needed(self, update: Update) -> bool:
+        if self._is_allowed(update):
+            return False
+        try:
+            allowed = ", ".join(sorted(self.allowed_chat_ids)) or "(not configured)"
+            await update.message.reply_text(
+                f"This bot only accepts commands for configured chat id(s): {allowed}.\n"
+                f"Current chat id: {update.effective_chat.id}"
+            )
+        except Exception:
+            pass
+        return True
 
     async def _cmd_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not self._is_allowed(update):
+        if await self._deny_if_needed(update):
             return
         await update.message.reply_text("🔍 Checking status, please wait...")
 
@@ -412,7 +433,7 @@ class TelegramCommandServer:
         )
 
     async def _cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not self._is_allowed(update):
+        if await self._deny_if_needed(update):
             return
         await update.message.reply_text(
             "<b>Bet Finder Agent — Commands</b>\n\n"
