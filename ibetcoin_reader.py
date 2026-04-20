@@ -19,7 +19,7 @@ LINE_RE = re.compile(
     r'(OVER|UNDER|O|U)\s*(\d+(?:\.\d+|[½?])?)(?:\s*[+-]\d{3,4})?',
     re.IGNORECASE,
 )  # handles "u173", "u221½-105", and "OVER 216"
-SPREAD_RE = re.compile(r'([+-]\d+\.?\d*)\s*$')
+SPREAD_RE = re.compile(r'([+-]\d+(?:\.\d+)?)')
 TICKET_RE = re.compile(r'Ticket\s*#?(\d+)', re.IGNORECASE)
 RISK_WIN_RE = re.compile(r'(\d[\d,]*)\s*/\s*(\d[\d,]*)')
 
